@@ -28,9 +28,14 @@ export const AuthCard: React.FC<AuthCardProps> = ({
   const [sandboxLoading, setSandboxLoading] = useState(false);
   const [copiedRedirect, setCopiedRedirect] = useState(false);
 
-  // Listen for postMessage from the OAuth callback popup
+  // Listen for postMessage from the OAuth callback popup with strict origin validation
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
+      // Validate origin strictly: only accept messages from the application's own origin
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+
       if (!event.data || typeof event.data !== 'object') return;
 
       if (event.data.type === 'OAUTH_AUTH_SUCCESS') {

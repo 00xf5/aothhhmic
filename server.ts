@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -13,10 +14,13 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
+// Trust reverse proxies (Cloud Run, Nginx, Docker) for accurate protocol and host detection
+app.set('trust proxy', true);
+
 app.use(express.json());
 app.use(cookieParser());
 
-// In-memory session store for boilerplate demo
+// In-memory session store for user sessions
 interface UserSession {
   user: {
     id: string;
@@ -42,16 +46,74 @@ interface UserSession {
 
 const sessions = new Map<string, UserSession>();
 
-function getRedirectUri(req: express.Request): string {
-  // If APP_URL is set in environment (e.g. Cloud Run), use it
-  if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
-    const cleanBase = process.env.APP_URL.replace(/\/+$/, '');
-    return `${cleanBase}/auth/callback`;
+// In-memory store for pending OAuth states (CSRF protection per RFC 6749)
+interface PendingOAuthState {
+  redirectUri: string;
+  clientOrigin: string;
+  createdAt: number;
+}
+
+const pendingOAuthStates = new Map<string, PendingOAuthState>();
+
+// Periodically prune stale pending states (TTL: 10 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of pendingOAuthStates.entries()) {
+    if (now - val.createdAt > 10 * 60 * 1000) {
+      pendingOAuthStates.delete(key);
+    }
   }
-  // Fallback to request origin
+}, 5 * 60 * 1000).unref();
+
+/**
+ * Determines whether the connection is secure (HTTPS).
+ * Handles proxies, Cloud Run, and explicit APP_URL configuration.
+ */
+function isSecureConnection(req: express.Request): boolean {
+  const forwardedProto = req.get('x-forwarded-proto');
+  if (forwardedProto) {
+    return forwardedProto.split(',')[0].trim().toLowerCase() === 'https';
+  }
+  if (req.secure) return true;
+  if (process.env.APP_URL && process.env.APP_URL.startsWith('https://')) return true;
+  return false;
+}
+
+/**
+ * Generates cookie options that function seamlessly on both localhost (HTTP)
+ * and production environments (HTTPS / Cloud Run / embedded iframes).
+ */
+function getCookieConfig(req: express.Request, maxAge?: number): express.CookieOptions {
+  const secure = isSecureConnection(req);
+  return {
+    httpOnly: true,
+    secure,
+    // In HTTPS production, 'none' permits cookies within cross-origin popups/iframes.
+    // In HTTP localhost development, browsers discard cookies set with 'none' unless secure is true,
+    // so 'lax' is required for localhost HTTP.
+    sameSite: secure ? 'none' : 'lax',
+    path: '/',
+    ...(maxAge !== undefined ? { maxAge } : {}),
+  };
+}
+
+/**
+ * Resolves the client origin from environment or incoming request headers.
+ */
+function getClientOrigin(req: express.Request): string {
+  if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
+    return process.env.APP_URL.replace(/\/+$/, '');
+  }
   const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:3000';
-  const proto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
-  return `${proto}://${host}/auth/callback`;
+  const proto = isSecureConnection(req) ? 'https' : 'http';
+  return `${proto}://${host}`;
+}
+
+/**
+ * Resolves the full redirect URI for Microsoft Entra ID callback.
+ */
+function getRedirectUri(req: express.Request): string {
+  return `${getClientOrigin(req)}/auth/callback`;
 }
 
 // -------------------------------------------------------------------
@@ -83,6 +145,7 @@ app.get('/api/auth/microsoft/url', (req, res) => {
   const clientId = process.env.AZURE_CLIENT_ID?.trim();
   const tenantId = process.env.AZURE_TENANT_ID?.trim() || 'common';
   const redirectUri = getRedirectUri(req);
+  const clientOrigin = getClientOrigin(req);
 
   if (!clientId) {
     return res.status(400).json({
@@ -91,16 +154,18 @@ app.get('/api/auth/microsoft/url', (req, res) => {
     });
   }
 
-  // Generate random CSRF state
-  const state = Math.random().toString(36).substring(2) + Date.now().toString(36);
+  // Cryptographically secure CSRF state generation
+  const state = crypto.randomBytes(32).toString('hex');
 
-  // Set state cookie with SameSite=None and Secure=true for iframe / cross-origin compliance
-  res.cookie('ms_oauth_state', state, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    maxAge: 10 * 60 * 1000, // 10 minutes
+  // Register state with its specific redirect URI and origin (10 min TTL)
+  pendingOAuthStates.set(state, {
+    redirectUri,
+    clientOrigin,
+    createdAt: Date.now(),
   });
+
+  // Set state cookie with environment-adaptive configuration (localhost vs prod)
+  res.cookie('ms_oauth_state', state, getCookieConfig(req, 10 * 60 * 1000));
 
   const params = new URLSearchParams({
     client_id: clientId,
@@ -128,9 +193,19 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
   const clientId = process.env.AZURE_CLIENT_ID?.trim();
   const clientSecret = process.env.AZURE_CLIENT_SECRET?.trim();
   const tenantId = process.env.AZURE_TENANT_ID?.trim() || 'common';
-  const redirectUri = getRedirectUri(req);
 
-  const renderCallbackHtml = (status: 'success' | 'error', payload: unknown, title: string) => {
+  const currentOrigin = getClientOrigin(req);
+  const cookieState = req.cookies.ms_oauth_state;
+
+  // Clear the state cookie after use
+  res.clearCookie('ms_oauth_state', getCookieConfig(req));
+
+  const renderCallbackHtml = (
+    status: 'success' | 'error',
+    payload: unknown,
+    title: string,
+    targetOrigin: string
+  ) => {
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -166,6 +241,8 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
       align-items: center;
       justify-content: center;
       border-radius: 50%;
+      font-size: 20px;
+      font-weight: bold;
     }
     .success-icon { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
     .error-icon { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
@@ -173,10 +250,10 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
     p { font-size: 14px; color: #94a3b8; margin: 0 0 20px; line-height: 1.5; }
     .spinner {
       border: 3px solid rgba(255, 255, 255, 0.1);
-      border-top: 3px solid #38bdf8;
+      border-top: 3px solid #0078d4;
       border-radius: 50%;
-      width: 20px;
-      height: 20px;
+      width: 22px;
+      height: 22px;
       animation: spin 0.8s linear infinite;
       margin: 12px auto;
     }
@@ -189,7 +266,7 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
       ${status === 'success' ? '&#10003;' : '&#10007;'}
     </div>
     <h2>${status === 'success' ? 'Authentication Successful' : 'Authentication Failed'}</h2>
-    <p>${status === 'success' ? 'Syncing your Microsoft profile with the application...' : (typeof payload === 'string' ? payload : 'An error occurred during authentication.')}</p>
+    <p>${status === 'success' ? 'Synchronizing your Microsoft account...' : (typeof payload === 'string' ? payload : 'An error occurred during authentication.')}</p>
     ${status === 'success' ? '<div class="spinner"></div>' : ''}
     <script>
       (function() {
@@ -197,9 +274,16 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
           type: ${status === 'success' ? "'OAUTH_AUTH_SUCCESS'" : "'OAUTH_AUTH_ERROR'"},
           payload: ${JSON.stringify(payload)}
         };
+        const targetOrigin = ${JSON.stringify(targetOrigin)};
 
-        if (window.opener) {
-          window.opener.postMessage(message, '*');
+        if (window.opener && !window.opener.closed) {
+          try {
+            // Tightened postMessage targeting the validated frontend origin
+            window.opener.postMessage(message, targetOrigin);
+          } catch (e) {
+            console.error('Target origin message failed, falling back to location.origin:', e);
+            window.opener.postMessage(message, window.location.origin);
+          }
           setTimeout(function() {
             window.close();
           }, 800);
@@ -215,20 +299,50 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
 </html>`;
   };
 
-  if (error) {
-    return res.send(renderCallbackHtml('error', error_description || error, 'Microsoft Auth Error'));
+  // 1. Verify OAuth State (CSRF Protection per RFC 6749 Section 10.12)
+  if (!state) {
+    return res.send(renderCallbackHtml('error', 'Missing OAuth state parameter. Request rejected for security.', 'State Verification Failed', currentOrigin));
   }
 
+  const storedState = pendingOAuthStates.get(state);
+  const isStateValid = Boolean(
+    (storedState && Date.now() - storedState.createdAt < 10 * 60 * 1000) ||
+    (cookieState && cookieState === state)
+  );
+
+  if (!isStateValid) {
+    return res.send(renderCallbackHtml(
+      'error',
+      'Invalid or expired OAuth state parameter. This authentication attempt was rejected to protect against CSRF attacks.',
+      'State Mismatch Error',
+      currentOrigin
+    ));
+  }
+
+  // Consume the state (single-use validation)
+  pendingOAuthStates.delete(state);
+
+  const targetOrigin = storedState?.clientOrigin || currentOrigin;
+  const redirectUri = storedState?.redirectUri || getRedirectUri(req);
+
+  // 2. Handle errors returned directly by Microsoft Entra ID
+  if (error) {
+    const errorMsg = error_description || error;
+    console.error(`Microsoft OAuth error response: ${error} - ${errorMsg}`);
+    return res.send(renderCallbackHtml('error', errorMsg, 'Microsoft Authentication Error', targetOrigin));
+  }
+
+  // 3. Verify presence of authorization code
   if (!code) {
-    return res.send(renderCallbackHtml('error', 'No authorization code received from Microsoft.', 'Auth Code Missing'));
+    return res.send(renderCallbackHtml('error', 'No authorization code was received from Microsoft identity provider.', 'Authorization Code Missing', targetOrigin));
   }
 
   if (!clientId || !clientSecret) {
-    return res.send(renderCallbackHtml('error', 'AZURE_CLIENT_ID or AZURE_CLIENT_SECRET is missing on the server.', 'Credentials Missing'));
+    return res.send(renderCallbackHtml('error', 'AZURE_CLIENT_ID or AZURE_CLIENT_SECRET is missing on the server.', 'Credentials Missing', targetOrigin));
   }
 
   try {
-    // 1. Exchange authorization code for tokens
+    // 4. Exchange authorization code for tokens with Microsoft STS
     const tokenEndpoint = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
     const tokenRequestBody = new URLSearchParams({
       client_id: clientId,
@@ -250,12 +364,13 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
 
     if (!tokenResponse.ok) {
       const errDetail = tokenData.error_description || tokenData.error || 'Token exchange failed';
-      return res.send(renderCallbackHtml('error', errDetail, 'Token Exchange Error'));
+      console.error('Token exchange failure:', tokenData);
+      return res.send(renderCallbackHtml('error', errDetail, 'Token Exchange Error', targetOrigin));
     }
 
     const accessToken = tokenData.access_token as string;
 
-    // 2. Fetch User Profile from Microsoft Graph API (/v1.0/me)
+    // 5. Fetch User Profile from Microsoft Graph API (/v1.0/me)
     const graphResponse = await fetch('https://graph.microsoft.com/v1.0/me', {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -264,13 +379,14 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
 
     if (!graphResponse.ok) {
       const graphError = await graphResponse.text();
-      return res.send(renderCallbackHtml('error', `Failed to fetch user profile from Microsoft Graph: ${graphError}`, 'Graph API Error'));
+      console.error('Microsoft Graph API error:', graphError);
+      return res.send(renderCallbackHtml('error', `Failed to retrieve user profile from Microsoft Graph: ${graphError}`, 'Graph API Error', targetOrigin));
     }
 
     const graphUser = await graphResponse.json() as Record<string, any>;
 
-    // 3. Create Session
-    const sessionId = 'ms_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+    // 6. Create Session with cryptographically secure session identifier
+    const sessionId = 'ms_sess_' + crypto.randomBytes(32).toString('base64url');
     const userSession: UserSession = {
       user: {
         id: graphUser.id || 'unknown-id',
@@ -296,18 +412,13 @@ app.get(['/auth/callback', '/auth/callback/'], async (req, res) => {
 
     sessions.set(sessionId, userSession);
 
-    // Set cookie with SameSite=none and Secure=true for cross-origin and embedded iframe compatibility
-    res.cookie('ms_session_id', sessionId, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      maxAge: 7 * 24 * 3600 * 1000, // 7 days
-    });
+    // Set session cookie using environment-adaptive cookie settings
+    res.cookie('ms_session_id', sessionId, getCookieConfig(req, 7 * 24 * 3600 * 1000));
 
-    return res.send(renderCallbackHtml('success', userSession, 'Login Successful'));
+    return res.send(renderCallbackHtml('success', userSession, 'Login Successful', targetOrigin));
   } catch (err: any) {
-    console.error('Callback error:', err);
-    return res.send(renderCallbackHtml('error', err?.message || 'Unexpected server error occurred.', 'Server Error'));
+    console.error('OAuth callback exception:', err);
+    return res.send(renderCallbackHtml('error', err?.message || 'An unexpected server error occurred.', 'Server Error', targetOrigin));
   }
 });
 
@@ -335,16 +446,11 @@ app.post('/api/auth/logout', (req, res) => {
     sessions.delete(sessionId);
   }
 
-  res.clearCookie('ms_session_id', {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-  });
-
+  res.clearCookie('ms_session_id', getCookieConfig(req));
   res.json({ success: true, message: 'Logged out successfully' });
 });
 
-// 6. Interactive Sandbox Demo Login (Allows learning & UI inspection before setting up Azure)
+// 6. Interactive Sandbox Demo Login (Allows testing and exploration before Azure registration)
 app.post('/api/auth/sandbox-login', (req, res) => {
   const sampleUser = req.body?.persona === 'alex' ? {
     id: 'azure-obj-98234-alexw',
@@ -370,7 +476,8 @@ app.post('/api/auth/sandbox-login', (req, res) => {
     mobilePhone: '+1 425 555 0188',
   };
 
-  const sessionId = 'ms_sandbox_' + Math.random().toString(36).substring(2);
+  // Secure session ID for sandbox sessions
+  const sessionId = 'ms_sandbox_' + crypto.randomBytes(32).toString('base64url');
   const session: UserSession = {
     user: sampleUser,
     tokens: {
@@ -385,12 +492,7 @@ app.post('/api/auth/sandbox-login', (req, res) => {
 
   sessions.set(sessionId, session);
 
-  res.cookie('ms_session_id', sessionId, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'none',
-    maxAge: 7 * 24 * 3600 * 1000,
-  });
+  res.cookie('ms_session_id', sessionId, getCookieConfig(req, 7 * 24 * 3600 * 1000));
 
   res.json({
     success: true,
