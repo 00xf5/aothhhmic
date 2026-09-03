@@ -1,0 +1,6 @@
+{
+  "name": "Microsoft Entra ID • Enterprise OAuth 2.0 Portal",
+  "description": "Production-ready Microsoft Entra ID (Azure AD) OAuth 2.0 authentication portal with Microsoft Graph API integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
